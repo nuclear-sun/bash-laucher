@@ -1,0 +1,335 @@
+#!/bin/bash
+
+# represent color
+G_COLOR_IND=0
+
+# Usage
+function usage() {
+    echo "Usage: runit [-c] [-f procfile|Procfile] [-e envfile|.env]"
+}
+
+#######################################
+# Brief:
+#   Cleanup processes from file .pid 
+#######################################
+function cleanup() {
+    while read pid ; do
+        kill -"${pid}" &> /dev/null
+    done < .pid
+}
+
+#######################################
+# Brief:
+#   Strip blank spaces and comments on both sides of 
+#       a line in proc or env file
+# Arguments:
+#   Line content
+# Returns:
+#   Stripped line
+#######################################
+function __strip() {
+    content="$@"
+    content=$(echo ${content%%#*})
+    echo ${content} # strip blank
+}
+
+#######################################
+# Brief:
+#   Parse a line in Procfile into id and the real command
+# Arguments:
+#   $@: Line content
+# Echo:
+#   Two lines: 
+#       id
+#       command
+#######################################
+function __parse_command_line() {
+    line=$( __strip "$@")
+    if [[ -z ${line}  ]]; then
+        echo 
+        return 1
+    else
+        lword=${line%%:*}
+        rword=${line#${lword}:}
+        echo $lword
+        echo $rword
+        return 0
+    fi
+}
+
+#######################################
+# Brief:
+#   Verify env file
+# Arguments:
+#   $ envfile
+# Returns:
+#   or 1
+#######################################
+function __verify_env(){
+    local ret=0
+    while read line ; do
+        line=$(__strip ${line}) # strip
+        flag=# mark if the line is problematic
+        if [[ -z ${line} ]]; then continue; fi
+        local lword=$(__strip ${line%%=*})
+        local rword=$(__strip ${line#*=})
+
+        if ! [[ ${#lword} -gt && ${#rword} -gt ]]; then
+            flag=1
+        fi
+        # guarantee no blank between equation
+        if [[ $((${#lword} + ${#rword})) -ne $((${#line} -)) ]]; then
+            flag=1
+        fi
+
+        # lword check
+        echo "${lword}" | grep -q -E '^[a-zA-Z]+$'
+        if [[ $? -ne ]]; then 
+            flag=1
+        fi
+
+        # blank within rword check 
+        echo "${rword}" | grep -qE '\B'
+        if [[ $? -eq ]]; then 
+            flag=1
+        fi
+        [[ $flag -eq ]] && {
+            echo $line
+            ret=1
+        }
+    done < $1
+    return $ret
+}
+
+#######################################
+# Brief:
+#   Verify proc file
+# Arguments:
+#   $ procfile
+# Returns:
+#   or 1
+#######################################
+function __verify_proc(){
+    >.dup # for duplication check
+    local ret=0
+    while read line ; do
+        line=$(__strip ${line}) # strip
+        [[ -z ${line} ]] && continue
+        flag=# mark if the line is problematic
+        # line format check 
+        local lword=${line%%:*} 
+        local rword=${line#${lword}:}
+        # strip blank space 
+        lword=$(echo $lword )
+        rword=$(echo $rword )
+        if ! [[ ${#lword} -gt && ${#rword} -gt ]]; then
+            flag=1
+        fi
+        # name format check
+        local result=$(echo "${lword}" | grep -E '^[a-zA-Z]+$')
+        if [[ -z ${result} ]]; then 
+            flag=1
+        fi
+        # duplicate check
+        local exist_id=$( grep ${lword} .dup )
+        if [[ -n ${exist_id} ]]; then 
+            #echo exist
+            flag=1
+        else
+            echo ${lword} >> .dup
+        fi
+        # background check
+        lastchar=${line:$((${#line}-)}
+        if [[ $lastchar == '&' ]]; then 
+            flag=1
+        fi
+
+        if [[ $flag -eq ]]; then
+            echo $line
+            ret=1
+        fi
+    done < $1
+    return $ret
+}
+
+#######################################
+# Brief:
+#   Verify envfile and procfile
+# Arguments:
+#   $ envfile, $ procfile
+# Returns:
+#   or 1
+#######################################
+function verify() {
+    local env_file=$1
+    local proc_file=$2
+    if [[ -n ${env_file} ]]; then
+        # check env_file
+        __verify_env ${env_file}
+        [[ $? != ]] && return 1
+    fi
+
+    if [[ -n ${proc_file} ]]; then
+        # check proc_file
+        __verify_proc ${proc_file}
+        [[ $? != ]] && return 1
+    fi
+    return 0
+}
+
+# log result
+function log(){
+    local timestamp="$(date '+%H:%M:%S')"
+    echo -e "\((++G_COLOR_IND % )m${timestamp} $@\"
+}
+
+#######################################
+# Brief:
+#   Expand params in command str
+# Arguments:
+#   $ envfile, $ procfile
+# Echos:
+#   Expanded command str
+# Returns:
+#   or 1
+#######################################
+function __expand_command_str(){
+    local command_str="$@"
+    local params=($(echo "${command_str}" |  grep -o -E '\$\w+|\$\{\w+\}' ) )
+    local error_flag=0
+
+    PORT=$(<.port)
+    
+    for param in ${params[@]}; do
+        #  param substitution
+        eval value="${param}"
+        command_str=${command_str/${param}/${value}}
+        #  check null param
+        [[ -z "${value}" ]] && {
+            error_flag=1
+            continue
+        }
+        #  port increase
+        if [[ "${param}" == '$PORT' || "${param}" == '${PORT}' ]]; then
+            ((PORT++))
+            echo ${PORT} > .port # use file to pass to parent process
+        fi
+    done
+    echo "${command_str}"
+    [[ ${error_flag} -ne ]] && return 1
+}
+    
+#######################################
+# Brief:
+#   Run one command from procfile in a subshell for safty concern
+# Arguments:
+#   None
+# Returns:
+#   None
+#######################################
+function run_command() {
+    local line="$@"
+    {
+        read first;
+        read second;
+    } < <(__parse_command_line "${line}")
+
+    echo > .notify
+    local expanded_command="$(__expand_command_str ${second} )"
+    # caution: $! must be expanded after command execution
+    bash -c "${expanded_command} & "'pid=$!; echo ${pid} >> .pid ; echo ${pid} >
+ .currPid; echo > .notify; wait' &
+    # spinlock
+    read notification < .notify
+    while [[ "${notification}" -ne ]]; do
+        read notification < .notify
+    done
+    echo > .notify
+    read pid < .currPid
+
+    local formatted_str=$(printf "% | %s started with pid %s" "${first}" \
+        "${expanded_command}" "${pid}")
+    log ${formatted_str}
+    #sleep 5
+}
+
+#######################################
+# Brief:
+#   Load env file
+# Arguments:
+#   $ envfile
+#######################################
+function load_env_file() {
+    local file="$
+
+    if [[ -f "${file}" ]]; then 
+        while read line; do
+            param="${line%%=*}"
+            value="${line#*=}"
+            # recover single quotation if there is in env file
+            if [[ ${value: == "'" ]]; then
+                value=\\\'"${value}"\\\'
+            fi
+            eval ${param}="${value}"
+        done < "${file}"
+    fi
+    if [[ -z "${PORT}" ]]; then
+        PORT=
+    fi
+}
+
+#######################################
+# Brief:
+#   Run procfile
+# Arguments:
+#   $ procfile
+#######################################
+function run_procfile() {
+    local procfile="$
+    # init
+    >.pid
+    echo "$PORT" > .port
+    # run
+    while read line || [[ -n "${line}" ]]; do
+        line=$(__strip "${line}")
+        if [[ -n "${line}" ]]; then
+            run_command "${line}"
+        fi
+    done < "${procfile}"
+}
+
+function main() {
+    local env_file='.env'
+    local proc_file='Procfile'
+    local check=0
+    while getopts "ce:f:" opt; do
+        case $opt in
+            e)
+                env_file=${OPTARG}
+                ;;
+            f)
+                proc_file=${OPTARG}
+                ;;
+            c)
+                check=1
+                ;;
+            ?)
+                usage
+                exit 1
+                ;;
+        esac
+    done
+    if [[ check -eq ]]; then
+        verify $env_file $proc_file
+        exit $?
+    fi
+
+    load_env_file $env_file
+    run_procfile $proc_file
+    wait
+}
+
+trap 'cleanup' SIGINT SIGTERM
+
+main "$@"
+
